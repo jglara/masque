@@ -8,7 +8,6 @@ use std::future::Future;
 use std::net::{ToSocketAddrs, SocketAddr};
 use std::collections::HashMap;
 use std::error::{Error, self};
-use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use tokio::io::{AsyncWriteExt, AsyncReadExt};
@@ -108,7 +107,7 @@ impl Client {
         debug!("creating socket");
         let socket = UdpSocket::bind("0.0.0.0:0".parse::<SocketAddr>().unwrap()).await?;
         socket.connect(peer_addr.clone()).await?;
-        let socket = Arc::new(socket);
+//        let socket = Arc::new(socket);
         debug!("connecting to {} at {}", server_name, peer_addr);
         
     
@@ -183,8 +182,7 @@ impl Client {
     
         let mut http3_conn: Option<quiche::h3::Connection> = None;
         let (http3_sender, mut http3_receiver) = mpsc::unbounded_channel::<ToSend>();
-        let connect_streams: Arc<Mutex<HashMap<u64, UnboundedSender<Content>>>> = Arc::new(Mutex::new(HashMap::new()));
-//        let connect_sockets: Arc<Mutex<HashMap<u64, UnboundedSender<Content>>>> = Arc::new(Mutex::new(HashMap::new()));
+        let mut connect_streams: HashMap<u64, UnboundedSender<Content>> = HashMap::new();
         let mut http3_retry_send: Option<ToSend> = None;
         let mut interval = time::interval(Duration::from_millis(20));
         interval.set_missed_tick_behavior(time::MissedTickBehavior::Delay);
@@ -228,7 +226,6 @@ impl Client {
                             match http3_conn.poll(&mut conn) {
                                 Ok((stream_id, quiche::h3::Event::Headers { list, .. })) => {
                                     info!("got response headers {:?} on stream id {}", hdrs_to_strings(&list), stream_id);
-                                    let connect_streams = connect_streams.lock().unwrap();
                                     if let Some(sender) = connect_streams.get(&stream_id) {
                                         sender.send(Content::Headers { stream_id, headers: list });
                                     }
@@ -240,7 +237,6 @@ impl Client {
             
                                 Ok((stream_id, quiche::h3::Event::Finished)) => {
                                     info!("finished received, stream id: {} closing", stream_id);
-                                    let mut connect_streams = connect_streams.lock().unwrap();
                                     if let Some(sender) = connect_streams.get(&stream_id) {
                                         connect_streams.remove(&stream_id);
                                     }
@@ -248,7 +244,6 @@ impl Client {
             
                                 Ok((stream_id, quiche::h3::Event::Reset(e))) => {
                                     error!("request was reset by peer with {}, stream id: {} closed", e, stream_id);
-                                    let mut connect_streams = connect_streams.lock().unwrap();
                                     if let Some(sender) = connect_streams.get(&stream_id) {
                                         connect_streams.remove(&stream_id);
                                     }
@@ -258,7 +253,6 @@ impl Client {
                                     loop {
                                         match http3_conn.recv_dgram(&mut conn, &mut buf) {
                                             Ok((read, flow_id, flow_id_len)) => {
-                                                let connect_streams = connect_streams.lock().unwrap();
                                                 debug!("got {} bytes of datagram on flow {} ({})", read, flow_id, _flow_id);
                                                 //trace!("{}", unsafe {std::str::from_utf8_unchecked(&buf[flow_id_len..read])});
                                                 if let Some(sender) = connect_streams.get(&flow_id) {
@@ -310,9 +304,8 @@ impl Client {
                             Content::Headers { .. } => unreachable!(),
                             Content::Request { headers, response_sender } => {
                                 debug!("sending http3 request {:?}", hdrs_to_strings(&headers));
-                                match http3_conn.send_request(&mut conn, headers, to_send.finished) {
+                                match http3_conn.send_request(&mut conn, &headers, to_send.finished) {
                                     Ok(stream_id) => {
-					let mut connect_streams = connect_streams.lock().unwrap();
 					connect_streams.insert(stream_id, response_sender.clone());
                                         Ok(())
                                     },
@@ -356,7 +349,6 @@ impl Client {
                                 conn.stream_shutdown(to_send.stream_id, quiche::Shutdown::Read, 0);
                                 conn.stream_shutdown(to_send.stream_id, quiche::Shutdown::Write, 0);
                                 {
-                                    let mut connect_streams = connect_streams.lock().unwrap();
                                     connect_streams.remove(&to_send.stream_id);
                                 }
                             }
@@ -421,7 +413,6 @@ impl Client {
                             error!("Connection {} stream {} send failed {:?}", conn.trace_id(), to_send.stream_id, e);
                             conn.stream_shutdown(to_send.stream_id, quiche::Shutdown::Write, 0);
                             {
-                                let mut connect_streams = connect_streams.lock().unwrap();
                                 connect_streams.remove(&to_send.stream_id);
                             }
                             http3_retry_send = None;
@@ -499,10 +490,12 @@ async fn handle_http1_stream(mut stream: TcpStream, http3_sender: UnboundedSende
     if let Some(method) = req.method {
         if let Some(path) = req.path {
             if method.eq_ignore_ascii_case("CONNECT") {
-                // TODO: Check Host?
+		let host_port = path.split(":").collect::<Vec<_>>();
+		assert!(host_port.len() == 2);
+
                 let headers = vec![
                     quiche::h3::Header::new(b":method", b"CONNECT"),
-		    quiche::h3::Header::new(b":path", format!("/udp/127.0.0.1/6969").as_bytes()),
+		    quiche::h3::Header::new(b":path", format!("/.well_known/masque/udp/{}/{}/", host_port[0], host_port[1]).as_bytes()),
                     quiche::h3::Header::new(b":protocol", b"connect-udp"),
                     quiche::h3::Header::new(b":scheme", b"dummy-scheme"),
                     quiche::h3::Header::new(b":authority", b"dummy-authority"),
