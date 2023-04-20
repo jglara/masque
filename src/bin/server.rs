@@ -1,46 +1,40 @@
 use log::*;
 use quiche::h3::NameValue;
 
-use std::net::{self, SocketAddr};
-use std::net::ToSocketAddrs;
 use std::collections::HashMap;
 use std::error::Error;
+use std::net::ToSocketAddrs;
+use std::net::{self, SocketAddr};
 use std::sync::Arc;
 
 //use tokio::io::{AsyncWriteExt, AsyncReadExt};
-use tokio::net::{UdpSocket, TcpStream};
+use tokio::net::UdpSocket;
 use tokio::sync::mpsc::{self, UnboundedSender};
 use tokio::time::{self, Duration};
 
-use ring::rand::*;
 use masque::*;
+use ring::rand::*;
 
 use std::env;
-
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn Error>> {
     env_logger::builder().format_timestamp_millis().init();
-    
+
     let bind_addr = env::args()
         .nth(1)
         .unwrap_or_else(|| "127.0.0.1:4433".to_string());
-    
+
     let mut server = Server::new();
     server.bind(bind_addr).await?;
 
     server.run().await
 }
 
-
 #[derive(PartialEq, Debug)]
 enum Content {
-    Headers {
-        headers: Vec<quiche::h3::Header>,
-    },
-    Datagram {
-        payload: Vec<u8>,
-    },
+    Headers { headers: Vec<quiche::h3::Header> },
+    Datagram { payload: Vec<u8> },
 }
 
 #[derive(Debug)]
@@ -89,46 +83,52 @@ impl Server {
      * Get the socket address the server is bound to. Returns None if server is not bound to a socket yet
      */
     pub fn listen_addr(&self) -> Option<SocketAddr> {
-        return self.socket.clone().map(|socket| socket.local_addr().unwrap())
+        return self
+            .socket
+            .clone()
+            .map(|socket| socket.local_addr().unwrap());
     }
 
     /**
      * Bind the server to listen to an address
      */
-    pub async fn bind<T: tokio::net::ToSocketAddrs>(&mut self, listen_addr: T) -> Result<(), Box<dyn Error>> {
+    pub async fn bind<T: tokio::net::ToSocketAddrs>(
+        &mut self,
+        listen_addr: T,
+    ) -> Result<(), Box<dyn Error>> {
         debug!("creating UDP socket");
-    
+
         // Create the UDP listening socket, and register it with the event loop.
         let socket = UdpSocket::bind(listen_addr).await?;
         debug!("listening on {}", socket.local_addr().unwrap());
-        
+
         self.socket = Some(Arc::new(socket));
         Ok(())
     }
 
     pub async fn run(&self) -> Result<(), Box<dyn Error>> {
         if self.socket.is_none() {
-            return Err(Box::new(RunBeforeBindError))
+            return Err(Box::new(RunBeforeBindError));
         }
         let socket = self.socket.clone().unwrap();
 
         let mut buf = [0; 65535];
         let mut out = [0; MAX_DATAGRAM_SIZE];
-    
+
         // Create the configuration for the QUIC connections.
         let mut config = quiche::Config::new(quiche::PROTOCOL_VERSION).unwrap();
-    
+
         config
             .load_cert_chain_from_pem_file("example_cert/cert.crt")
             .unwrap();
         config
             .load_priv_key_from_pem_file("example_cert/cert.key")
             .unwrap();
-    
+
         config
             .set_application_protos(quiche::h3::APPLICATION_PROTOCOL)
             .unwrap();
-    
+
         // TODO: allow custom configuration of the following parameters and also consider the defaults more carefully
         config.set_max_idle_timeout(1000);
         config.set_max_recv_udp_payload_size(MAX_DATAGRAM_SIZE);
@@ -140,95 +140,87 @@ impl Server {
         config.set_initial_max_streams_bidi(100);
         config.set_initial_max_streams_uni(100);
         config.set_disable_active_migration(true);
-        config.enable_dgram(true, 1000, 1000); 
+        config.enable_dgram(true, MAX_DATAGRAM_SIZE * 10, MAX_DATAGRAM_SIZE * 10);
         config.enable_early_data();
-    
+
         let rng = SystemRandom::new();
-        let conn_id_seed =
-            ring::hmac::Key::generate(ring::hmac::HMAC_SHA256, &rng).unwrap();
-    
+        let conn_id_seed = ring::hmac::Key::generate(ring::hmac::HMAC_SHA256, &rng).unwrap();
+
         let mut clients = ClientMap::new();
         // let mut tcp_connections = TokenMap::new();
-    
+
         let local_addr = socket.local_addr().unwrap();
-    
+
         'read: loop {
             let (len, from) = match socket.recv_from(&mut buf).await {
                 Ok(v) => v,
-    
+
                 Err(e) => {
                     panic!("recv_from() failed: {:?}", e);
-                },
+                }
             };
-    
+
             debug!("got {} bytes", len);
-    
+
             let pkt_buf = &mut buf[..len];
-    
+
             // Parse the QUIC packet's header.
-            let hdr = match quiche::Header::from_slice(
-                pkt_buf,
-                quiche::MAX_CONN_ID_LEN,
-            ) {
+            let hdr = match quiche::Header::from_slice(pkt_buf, quiche::MAX_CONN_ID_LEN) {
                 Ok(v) => v,
-    
+
                 Err(e) => {
                     error!("Parsing packet header failed: {:?}", e);
                     continue 'read;
-                },
+                }
             };
-    
+
             debug!("got packet {:?}", hdr);
-    
+
             let conn_id = ring::hmac::sign(&conn_id_seed, &hdr.dcid);
             let conn_id = &conn_id.as_ref()[..quiche::MAX_CONN_ID_LEN];
             let conn_id = conn_id.to_vec().into();
-    
+
             // Lookup a connection based on the packet's connection ID. If there
             // is no connection matching, create a new one.
-            let tx = if !clients.contains_key(&hdr.dcid) &&
-                !clients.contains_key(&conn_id)
-            {
+            let tx = if !clients.contains_key(&hdr.dcid) && !clients.contains_key(&conn_id) {
                 // TODO: move initialization to client task
                 if hdr.ty != quiche::Type::Initial {
                     error!("Packet is not Initial");
                     continue 'read;
                 }
-    
+
                 if !quiche::version_is_supported(hdr.version) {
                     warn!("Doing version negotiation");
-    
-                    let len =
-                        quiche::negotiate_version(&hdr.scid, &hdr.dcid, &mut out)
-                            .unwrap();
-    
+
+                    let len = quiche::negotiate_version(&hdr.scid, &hdr.dcid, &mut out).unwrap();
+
                     let out = &out[..len];
-    
+
                     if let Err(e) = socket.send_to(out, from).await {
                         if e.kind() == std::io::ErrorKind::WouldBlock {
                             debug!("send_to() would block");
                             break;
                         }
-    
+
                         panic!("send_to() failed: {:?}", e);
                     }
                     continue 'read;
                 }
-    
+
                 let mut scid = [0; quiche::MAX_CONN_ID_LEN];
                 scid.copy_from_slice(&conn_id);
-    
+
                 let scid = quiche::ConnectionId::from_ref(&scid);
-    
+
                 // Token is always present in Initial packets.
                 let token = hdr.token.as_ref().unwrap();
-    
+
                 // Do stateless retry if the client didn't send a token.
                 if token.is_empty() {
                     warn!("Doing stateless retry");
-    
+
                     let new_token = mint_token(&hdr, &from);
-    
+
                     let len = quiche::retry(
                         &hdr.scid,
                         &hdr.dcid,
@@ -238,91 +230,84 @@ impl Server {
                         &mut out,
                     )
                     .unwrap();
-    
+
                     let out = &out[..len];
-    
+
                     if let Err(e) = socket.send_to(out, from).await {
                         if e.kind() == std::io::ErrorKind::WouldBlock {
                             debug!("send_to() would block");
                             break;
                         }
-    
+
                         panic!("send_to() failed: {:?}", e);
                     }
                     continue 'read;
                 }
-    
+
                 let odcid = validate_token(&from, token);
-    
+
                 // The token was not valid, meaning the retry failed, so
                 // drop the packet.
                 if odcid.is_none() {
                     error!("Invalid address validation token");
                     continue 'read;
                 }
-    
+
                 if scid.len() != hdr.dcid.len() {
                     error!("Invalid destination connection ID");
                     continue 'read;
                 }
-    
+
                 // Reuse the source connection ID we sent in the Retry packet,
                 // instead of changing it again.
                 let scid = hdr.dcid.clone();
-    
+
                 debug!("New connection: dcid={:?} scid={:?}", hdr.dcid, scid);
-    
-                let conn = quiche::accept(
-                    &scid,
-                    odcid.as_ref(),
-                    local_addr,
-                    from,
-                    &mut config,
-                )
-                .unwrap();
-    
+
+                let conn =
+                    quiche::accept(&scid, odcid.as_ref(), local_addr, from, &mut config).unwrap();
+
                 let (tx, rx) = mpsc::unbounded_channel();
-    
+
                 let client = Client {
                     conn,
                     quic_receiver: rx,
                     socket: socket.clone(),
                 };
-    
+
                 clients.insert(scid.clone(), tx);
-    
-                tokio::spawn(async move {
-                    handle_client(client).await
-                });
-    
+
+                tokio::spawn(async move { handle_client(client).await });
+
                 clients.get(&scid).unwrap()
             } else {
                 match clients.get(&hdr.dcid) {
                     Some(v) => v,
-    
+
                     None => clients.get(&conn_id).unwrap(),
                 }
             };
-    
+
             let recv_info = quiche::RecvInfo {
                 to: socket.local_addr().unwrap(),
                 from,
             };
-            
-            match tx.send(QuicReceived { recv_info, data: pkt_buf.to_vec() }) {
-                Ok(_) => {},
+
+            match tx.send(QuicReceived {
+                recv_info,
+                data: pkt_buf.to_vec(),
+            }) {
+                Ok(_) => {}
                 _ => {
                     debug!("Error sending to {:?}", &hdr.dcid);
                     clients.remove(&hdr.dcid);
                 }
             }
-    
         }
-    
+
         Ok(())
     }
 }
-
 
 /**
  * Client handler that handles the connection for a single client
@@ -359,9 +344,9 @@ async fn handle_client(mut client: Client) {
                         },
                         Content::Datagram { payload } => {
                             debug!("sending http3 datagram of {} bytes to flow {}", payload.len(), to_send.stream_id);
-			    // add context_id
-			    let mut enc_context_id = encode_var_int(0);
-			    enc_context_id.append(&mut payload.clone());			    
+                // add context_id
+                let mut enc_context_id = encode_var_int(0);
+                enc_context_id.append(&mut payload.clone());
                             http3_conn.send_dgram(&mut client.conn, to_send.stream_id, &enc_context_id)
                         },
                     };
@@ -370,12 +355,12 @@ async fn handle_client(mut client: Client) {
                         Err(quiche::h3::Error::StreamBlocked | quiche::h3::Error::Done) => {
                             debug!("Connection {} stream {} stream blocked, retry later", client.conn.trace_id(), to_send.stream_id);
                             http3_retry_send = Some(to_send);
-                            break; 
+                            break;
                         },
                         Err(e) => {
                             error!("Connection {} stream {} send failed {:?}", client.conn.trace_id(), to_send.stream_id, e);
-                            client.conn.stream_shutdown(to_send.stream_id, quiche::Shutdown::Read, 0);
-                            client.conn.stream_shutdown(to_send.stream_id, quiche::Shutdown::Write, 0);
+                            client.conn.stream_shutdown(to_send.stream_id, quiche::Shutdown::Read, 0).unwrap();
+                            client.conn.stream_shutdown(to_send.stream_id, quiche::Shutdown::Write, 0).unwrap();
                         }
                     };
                     to_send = match http3_receiver.try_recv() {
@@ -397,7 +382,7 @@ async fn handle_client(mut client: Client) {
                             }
                         };
                         debug!("{} processed {} bytes", client.conn.trace_id(), read);
-                        
+
                     },
                     None => {
                         break // channel closed on the other side. Should not happen?
@@ -445,13 +430,13 @@ async fn handle_client(mut client: Client) {
                                     hdrs_to_strings(&headers),
                                     stream_id
                                 );
-                            
+
                                 let mut method = None;
                                 let mut authority = None;
                                 let mut protocol = None;
                                 let mut scheme = None;
                                 let mut path = None;
-                            
+
                                 // Look for the request's path and method.
                                 for hdr in headers.iter() {
                                     match hdr.name() {
@@ -463,7 +448,7 @@ async fn handle_client(mut client: Client) {
                                         _ => (),
                                     }
                                 }
-                            
+
                                 match method {
                                     Some(b"CONNECT") => {
                                         if let Some(authority) = authority {
@@ -490,7 +475,7 @@ async fn handle_client(mut client: Client) {
                                                         };
                                                         let socket = Arc::new(socket);
                                                         let socket_clone = socket.clone();
-                                                        let read_task = tokio::spawn(async move {
+                                                        tokio::spawn(async move {
                                                             let mut buf = [0; 65527]; // max length of UDP Proxying Payload, ref: https://www.rfc-editor.org/rfc/rfc9298.html#name-http-datagram-payload-forma
                                                             loop {
                                                                 let read = match socket_clone.recv(&mut buf).await {
@@ -506,10 +491,10 @@ async fn handle_client(mut client: Client) {
                                                                 }
                                                                 debug!("read {} bytes from UDP from {} for flow {}", read, peer_addr, flow_id);
                                                                 let data = wrap_udp_connect_payload(0, &buf[..read]);
-                                                                http3_sender_clone_1.send(ToSend { stream_id: flow_id, content: Content::Datagram { payload: data }, finished: false });
+                                                                http3_sender_clone_1.send(ToSend { stream_id: flow_id, content: Content::Datagram { payload: data }, finished: false }).unwrap();
                                                             }
                                                         });
-                                                        let write_task = tokio::spawn(async move {
+                                                        tokio::spawn(async move {
                                                             loop {
                                                                 let data = match udp_receiver.recv().await {
                                                                     Some(v) => v,
@@ -519,7 +504,7 @@ async fn handle_client(mut client: Client) {
                                                                     },
                                                                 };
                                                                 let (context_id, payload) = decode_var_int(&data);
-								debug!("received UDP Proxying Datagram with context_id={:?} ", context_id);
+                                debug!("received UDP Proxying Datagram with context_id={:?} ", context_id);
                                                                 //assert_eq!(context_id, 0, "received UDP Proxying Datagram with non-zero Context ID");
 
                                                                 trace!("start sending on UDP");
@@ -540,21 +525,21 @@ async fn handle_client(mut client: Client) {
                                                             quiche::h3::Header::new(b":status", b"200"),
                                                         ];
                                                         http3_sender_clone_2.send(ToSend { stream_id, content: Content::Headers { headers }, finished: false }).expect("channel send failed");
-                                                        tokio::join!(read_task, write_task);
+                                                        //tokio::join!(read_task, write_task);
                                                     });
                                                 } else {
-						    todo!()
-						}
+                            todo!()
+                        }
                                             } else {
-						panic!();
+                        panic!();
                                                 // TODO: send error
                                             }
                                         } else {
-					    panic!();
+                        panic!();
                                             // TODO: send error
                                         }
                                     },
-                            
+
                                     _ => {},
                                 };
                             },
@@ -572,11 +557,11 @@ async fn handle_client(mut client: Client) {
 
                             Ok((stream_id, quiche::h3::Event::Finished)) => {
                                 info!("finished received, stream id: {} closing", stream_id);
-                            }, 
+                            },
 
                             Ok((stream_id, quiche::h3::Event::Reset(e))) => {
                                 error!("request was reset by peer with {}, stream id: {} closed", e, stream_id);
-                            }, 
+                            },
 
                             Ok((_flow_id, quiche::h3::Event::Datagram)) => {
                                 loop {
@@ -629,7 +614,7 @@ async fn handle_client(mut client: Client) {
 
             // Retry sending in case of stream blocking
             _ = interval.tick(), if http3_conn.is_some() && http3_retry_send.is_some() => {
-                let mut to_send = http3_retry_send.unwrap();
+                let to_send = http3_retry_send.unwrap();
                 let http3_conn = http3_conn.as_mut().unwrap();
                 let result = match &to_send.content {
                     Content::Headers { headers } => {
@@ -651,8 +636,8 @@ async fn handle_client(mut client: Client) {
                     },
                     Err(e) => {
                         error!("Connection {} stream {} send failed {:?}", client.conn.trace_id(), to_send.stream_id, e);
-                        client.conn.stream_shutdown(to_send.stream_id, quiche::Shutdown::Read, 0);
-                        client.conn.stream_shutdown(to_send.stream_id, quiche::Shutdown::Write, 0);
+                        client.conn.stream_shutdown(to_send.stream_id, quiche::Shutdown::Read, 0).unwrap();
+                        client.conn.stream_shutdown(to_send.stream_id, quiche::Shutdown::Write, 0).unwrap();
                         http3_retry_send = None;
                     }
                 };
@@ -680,23 +665,31 @@ async fn handle_client(mut client: Client) {
                 Err(quiche::Error::Done) => {
                     debug!("QUIC connection {} done writing", client.conn.trace_id());
                     break;
-                },
+                }
 
                 Err(e) => {
-                    error!("QUIC connection {} send failed: {:?}", client.conn.trace_id(), e);
+                    error!(
+                        "QUIC connection {} send failed: {:?}",
+                        client.conn.trace_id(),
+                        e
+                    );
 
                     client.conn.close(false, 0x1, b"fail").ok();
                     break;
-                },
+                }
             };
 
             match client.socket.send_to(&out[..write], send_info.to).await {
-                Ok(written) => debug!("{} written {} bytes out of {}", client.conn.trace_id(), written, write),
+                Ok(written) => debug!(
+                    "{} written {} bytes out of {}",
+                    client.conn.trace_id(),
+                    written,
+                    write
+                ),
                 Err(e) => panic!("UDP socket send_to() failed: {:?}", e),
             }
         }
     }
-    
 }
 
 /// Generate a stateless retry token.
@@ -731,9 +724,7 @@ fn mint_token(hdr: &quiche::Header, src: &net::SocketAddr) -> Vec<u8> {
 ///
 /// Note that this function is only an example and doesn't do any cryptographic
 /// authenticate of the token. *It should not be used in production system*.
-fn validate_token<'a>(
-    src: &net::SocketAddr, token: &'a [u8],
-) -> Option<quiche::ConnectionId<'a>> {
+fn validate_token<'a>(src: &net::SocketAddr, token: &'a [u8]) -> Option<quiche::ConnectionId<'a>> {
     if token.len() < 6 {
         return None;
     }
@@ -769,7 +760,7 @@ fn path_to_socketaddr(path: &[u8]) -> Option<net::SocketAddr> {
             second_last = last;
             last = Some(curr);
         } else {
-            return None
+            return None;
         }
     }
     if second_last.is_some() && last.is_some() {
@@ -783,7 +774,7 @@ fn path_to_socketaddr(path: &[u8]) -> Option<net::SocketAddr> {
             if let Ok(url) = url {
                 let socket_addrs = url.to_socket_addrs();
                 if let Ok(mut socket_addrs) = socket_addrs {
-                    return socket_addrs.next()
+                    return socket_addrs.next();
                 }
             }
         }
